@@ -1,0 +1,53 @@
+import { vibly } from '@/lib/vibly'
+
+type YmapsConfig = { apiKey?: string; loaderUrl?: string }
+
+// Минимальное описание глобального объекта JS API v3, которое нам нужно.
+export type Ymaps3 = {
+  ready: Promise<void>
+  YMap: new (container: HTMLElement, options: object) => YMapInstance
+  YMapDefaultSchemeLayer: new (options: object) => object
+  YMapDefaultFeaturesLayer: new (options: object) => object
+  YMapMarker: new (options: { coordinates: [number, number] }, element: HTMLElement) => object
+}
+
+export type YMapInstance = {
+  addChild: (child: object) => void
+  removeChild: (child: object) => void
+  update: (options: object) => void
+  destroy: () => void
+}
+
+declare global {
+  interface Window {
+    ymaps3?: Ymaps3
+  }
+}
+
+let loadPromise: Promise<Ymaps3> | null = null
+
+/** Загружает JS API Яндекс Карт один раз; ключ берётся из серверной функции, не из исходников. */
+export function loadYandexMaps(): Promise<Ymaps3> {
+  if (!loadPromise) {
+    loadPromise = (async () => {
+      const { data, error } = await vibly.functions.invoke<YmapsConfig>('yandex-maps-js', { body: {} })
+      if (error) throw new Error(error.message)
+      const src = data?.loaderUrl ?? `https://api-maps.yandex.ru/v3/?apikey=${data?.apiKey ?? ''}&lang=ru_RU`
+      await new Promise<void>((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = src
+        script.async = true
+        script.onload = () => resolve()
+        script.onerror = () => reject(new Error('Не удалось загрузить скрипт Яндекс Карт'))
+        document.head.appendChild(script)
+      })
+      if (!window.ymaps3) throw new Error('Яндекс Карты не инициализировались')
+      await window.ymaps3.ready
+      return window.ymaps3
+    })().catch((cause: unknown) => {
+      loadPromise = null
+      throw cause
+    })
+  }
+  return loadPromise
+}

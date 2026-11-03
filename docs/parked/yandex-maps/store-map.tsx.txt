@@ -1,0 +1,166 @@
+import { useEffect, useRef, useState } from 'react'
+import { Footprints, X } from 'lucide-react'
+import { SEARCH_RADIUS_METERS, type Coordinates, type NearbyStore, type StoreId } from '@/lib/nearby-stores'
+import { loadYandexMaps, type YMapInstance, type Ymaps3 } from '@/lib/yandex-maps'
+
+const brandColors: Record<StoreId, string> = {
+  vkusvill: '#348252',
+  pyaterochka: '#cf3c48',
+  perekrestok: '#337b4c',
+  magnit: '#d14548',
+  auchan: '#df493d',
+}
+
+const brandUrls: Record<StoreId, string> = {
+  vkusvill: 'https://vkusvill.ru/',
+  pyaterochka: 'https://5ka.ru/',
+  perekrestok: 'https://www.perekrestok.ru/',
+  magnit: 'https://magnit.ru/',
+  auchan: 'https://www.auchan.ru/',
+}
+
+const escapeHtml = (value: string) => value.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`)
+
+/** Круг радиуса поиска как полигон (JS API v3 не даёт готового круга). Координаты: [lon, lat]. */
+function circleRing(center: Coordinates, radiusMeters: number, steps = 64): [number, number][] {
+  const dLat = radiusMeters / 111320
+  const dLon = radiusMeters / (111320 * Math.cos((center.lat * Math.PI) / 180))
+  return Array.from({ length: steps + 1 }, (_, index) => {
+    const angle = (index / steps) * 2 * Math.PI
+    return [center.lon + dLon * Math.cos(angle), center.lat + dLat * Math.sin(angle)]
+  })
+}
+
+function storeMarkerHtml(name: string, color: string, count: number) {
+  const badge = count > 0 ? `<span class="safebite-map-badge">${count}</span>` : ''
+  return `<span class="safebite-map-pin" style="--pin-color:${color}"><span class="safebite-map-dot"></span>${badge}</span><span class="safebite-store-label">${escapeHtml(name)}</span>`
+}
+
+export function StoreMap({
+  center,
+  stores,
+  cartCountByStore,
+}: {
+  center: Coordinates
+  stores: NearbyStore[]
+  cartCountByStore: Partial<Record<StoreId, number>>
+}) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const mapRef = useRef<YMapInstance | null>(null)
+  const ymapsRef = useRef<Ymaps3 | null>(null)
+  const [ready, setReady] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+
+  // Создаём карту один раз.
+  useEffect(() => {
+    let cancelled = false
+    loadYandexMaps()
+      .then((ymaps) => {
+        if (cancelled || !containerRef.current) return
+        ymapsRef.current = ymaps
+        const map = new ymaps.YMap(containerRef.current, {
+          location: { center: [center.lon, center.lat], zoom: 15 },
+        })
+        map.addChild(new ymaps.YMapDefaultSchemeLayer({}))
+        map.addChild(new ymaps.YMapDefaultFeaturesLayer({}))
+        mapRef.current = map
+        setReady(true)
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled) setError(cause instanceof Error ? cause.message : 'Не удалось загрузить карту')
+      })
+    return () => {
+      cancelled = true
+      mapRef.current?.destroy()
+      mapRef.current = null
+      setReady(false)
+    }
+    // Карта создаётся один раз; центр и маркеры обновляются ниже.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Центр карты при смене координат.
+  useEffect(() => {
+    mapRef.current?.update({ location: { center: [center.lon, center.lat], zoom: 15 } })
+  }, [center.lat, center.lon])
+
+  // Радиус, метка пользователя и маячки магазинов.
+  useEffect(() => {
+    const map = mapRef.current
+    const ymaps = ymapsRef.current
+    if (!ready || !map || !ymaps) return
+
+    const children: object[] = []
+    const featureCtor = (ymaps as unknown as { YMapFeature: new (o: object, s: object) => object }).YMapFeature
+    children.push(
+      new featureCtor(
+        {
+          id: 'search-radius',
+          geometry: { type: 'Polygon', coordinates: [circleRing(center, SEARCH_RADIUS_METERS)] },
+          style: { stroke: [{ color: '#647a68', width: 1, dash: [5, 6] }], fill: '#e4ebe4', fillOpacity: 0.12 },
+        },
+        {},
+      ),
+    )
+
+    const userEl = document.createElement('div')
+    userEl.className = 'safebite-ymap-marker'
+    userEl.innerHTML = '<span class="safebite-user-pin"><span></span></span>'
+    children.push(new ymaps.YMapMarker({ coordinates: [center.lon, center.lat] }, userEl))
+
+    for (const store of stores) {
+      const count = cartCountByStore[store.storeId] ?? 0
+      const el = document.createElement('button')
+      el.type = 'button'
+      el.className = 'safebite-ymap-marker'
+      el.setAttribute('aria-label', `${store.name}, ${store.address}`)
+      el.innerHTML = storeMarkerHtml(store.name, brandColors[store.storeId], count)
+      el.addEventListener('click', () => setSelectedId(store.id))
+      children.push(new ymaps.YMapMarker({ coordinates: [store.lon, store.lat] }, el))
+    }
+
+    for (const child of children) map.addChild(child)
+    return () => {
+      for (const child of children) map.removeChild(child)
+    }
+  }, [ready, center, stores, cartCountByStore])
+
+  const selected = stores.find((store) => store.id === selectedId)
+  const selectedCount = selected ? (cartCountByStore[selected.storeId] ?? 0) : 0
+
+  return (
+    <div className="relative h-[300px] w-full overflow-hidden">
+      <div ref={containerRef} className="absolute inset-0" />
+      {error && (
+        <div className="absolute inset-0 flex items-center justify-center bg-[#f7f8f6] px-6 text-center text-[11px] text-[#858d86]">{error}</div>
+      )}
+      {selected && (
+        <div className="absolute inset-x-3 bottom-3 z-10 rounded-xl border border-[#e5e8e4] bg-white p-3.5 shadow-lg">
+          <button
+            aria-label="Закрыть"
+            className="absolute right-2 top-2 flex size-7 items-center justify-center rounded-md text-[#747d75] hover:bg-[#f2f4f1]"
+            onClick={() => setSelectedId(null)}
+            type="button"
+          >
+            <X aria-hidden="true" size={14} />
+          </button>
+          <p className="pr-8 text-xs font-semibold text-[#303832]">{selected.name}</p>
+          <p className="mt-1 text-[10px] leading-4 text-[#6f786f]">{selected.address}</p>
+          <p className="mt-1.5 flex items-center gap-1.5 text-[10px] font-medium text-[#59655b]">
+            <Footprints aria-hidden="true" size={12} />
+            {selected.distanceMeters < 1000 ? `${selected.distanceMeters} м` : `${(selected.distanceMeters / 1000).toFixed(1)} км`} · {selected.walkingMinutes} мин пешком
+          </p>
+          {selectedCount > 0 && (
+            <p className="mt-1.5 text-[10px] font-semibold" style={{ color: brandColors[selected.storeId] }}>
+              В корзине: {selectedCount} шт.
+            </p>
+          )}
+          <a className="mt-2 block text-center text-[10px] text-[#747d75] underline underline-offset-2" href={brandUrls[selected.storeId]} rel="noreferrer" target="_blank">
+            Сайт магазина
+          </a>
+        </div>
+      )}
+    </div>
+  )
+}

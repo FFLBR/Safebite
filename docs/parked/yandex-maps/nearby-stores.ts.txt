@@ -1,0 +1,111 @@
+export type StoreId = 'vkusvill' | 'pyaterochka' | 'perekrestok' | 'magnit' | 'auchan'
+export type Coordinates = { lat: number; lon: number }
+export type NearbyStore = {
+  id: string
+  name: string
+  storeId: StoreId
+  lat: number
+  lon: number
+  address: string
+  distanceMeters: number
+  walkingMinutes: number
+}
+
+export const SEARCH_RADIUS_METERS = 2000
+const WALKING_SPEED_METERS_PER_MINUTE = 80
+
+const brandPatterns: { storeId: StoreId; pattern: RegExp; overpassNames: string[] }[] = [
+  { storeId: 'vkusvill', pattern: /вкусвилл/i, overpassNames: ['ВкусВилл', 'Вкусвилл', 'вкусвилл'] },
+  { storeId: 'pyaterochka', pattern: /пятёрочка|пятерочка|5ka/i, overpassNames: ['Пятёрочка', 'Пятерочка', 'пятёрочка', 'пятерочка'] },
+  { storeId: 'perekrestok', pattern: /перекрёсток|перекресток/i, overpassNames: ['Перекрёсток', 'Перекресток', 'перекрёсток', 'перекресток'] },
+  { storeId: 'magnit', pattern: /магнит/i, overpassNames: ['Магнит', 'магнит'] },
+  { storeId: 'auchan', pattern: /ашан|auchan/i, overpassNames: ['Ашан', 'ашан', 'Auchan'] },
+]
+
+export const storeBrandNames: Record<StoreId, string> = {
+  vkusvill: 'ВкусВилл',
+  pyaterochka: 'Пятёрочка',
+  perekrestok: 'Перекрёсток',
+  magnit: 'Магнит',
+  auchan: 'Ашан',
+}
+
+const OVERPASS_ENDPOINTS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter',
+]
+const OVERPASS_ENDPOINT_TIMEOUT_MS = 12000
+
+type OverpassElement = {
+  type: string
+  id: number
+  lat?: number
+  lon?: number
+  center?: { lat: number; lon: number }
+  tags?: Record<string, string>
+}
+
+export function distanceMeters(from: Coordinates, to: Coordinates) {
+  const toRad = (value: number) => (value * Math.PI) / 180
+  const earthRadius = 6371000
+  const dLat = toRad(to.lat - from.lat)
+  const dLon = toRad(to.lon - from.lon)
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(from.lat)) * Math.cos(toRad(to.lat)) * Math.sin(dLon / 2) ** 2
+  return 2 * earthRadius * Math.asin(Math.sqrt(a))
+}
+
+function buildQuery(center: Coordinates) {
+  const names = brandPatterns.flatMap((brand) => brand.overpassNames).join('|')
+  return `[out:json][timeout:20];nwr(around:${SEARCH_RADIUS_METERS},${center.lat},${center.lon})["shop"]["name"~"^(${names})"];out center tags 300;`
+}
+
+export async function fetchNearbyStores(center: Coordinates, signal: AbortSignal): Promise<NearbyStore[]> {
+  const body = new URLSearchParams({ data: buildQuery(center) })
+  let lastError: unknown = new Error('Не удалось загрузить магазины')
+
+  for (const endpoint of OVERPASS_ENDPOINTS) {
+    try {
+      const timeout = AbortSignal.timeout(OVERPASS_ENDPOINT_TIMEOUT_MS)
+      const response = await fetch(endpoint, { method: 'POST', body, signal: AbortSignal.any([signal, timeout]) })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const json = (await response.json()) as { elements?: OverpassElement[] }
+      const seen = new Set<string>()
+      const stores: NearbyStore[] = []
+
+      for (const element of json.elements ?? []) {
+        const lat = element.lat ?? element.center?.lat
+        const lon = element.lon ?? element.center?.lon
+        const name = element.tags?.name ?? ''
+        const brand = brandPatterns.find((item) => item.pattern.test(name))
+        if (lat === undefined || lon === undefined || !brand) continue
+        const id = `${element.type}-${element.id}`
+        if (seen.has(id)) continue
+        seen.add(id)
+
+        const distance = Math.round(distanceMeters(center, { lat, lon }))
+        if (distance > SEARCH_RADIUS_METERS) continue
+        const tags = element.tags ?? {}
+        const address = [tags['addr:street'], tags['addr:housenumber']].filter(Boolean).join(', ') || 'адрес не указан в OpenStreetMap'
+
+        stores.push({
+          id,
+          name: storeBrandNames[brand.storeId],
+          storeId: brand.storeId,
+          lat,
+          lon,
+          address,
+          distanceMeters: distance,
+          walkingMinutes: Math.max(1, Math.round(distance / WALKING_SPEED_METERS_PER_MINUTE)),
+        })
+      }
+
+      return stores.sort((first, second) => first.distanceMeters - second.distanceMeters)
+    } catch (error) {
+      if (signal.aborted) throw error
+      lastError = error
+    }
+  }
+
+  throw lastError
+}
